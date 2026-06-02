@@ -21,7 +21,8 @@ from collision_detector import ModelFreeCollisionDetector
 from data_utils import CameraInfo, create_point_cloud_from_depth_image
 
 from manipulator_grasp.arm.motion_planning import *
-from manipulator_grasp.env.ur5_grasp_env import UR5GraspEnv
+from manipulator_grasp.env.piper_grasp_env import PiperGraspEnv
+from manipulator_grasp.utils import mj
 
 
 def get_net():
@@ -123,16 +124,95 @@ def generate_grasps(net, imgs, visual=False):
     return gg
 
 
-if __name__ == '__main__':
-    net = get_net()
+def run_planners(env, robot, action, planner_array, time_array):
+    total_time = np.sum(time_array)
+    time_step_num = round(total_time / 0.002) + 1
+    times = np.linspace(0.0, total_time, time_step_num)
+    time_cumsum = np.cumsum(time_array)
 
-    env = UR5GraspEnv()
-    env.reset()
-    for i in range(1000):
+    for timei in times:
+        if timei == 0.0:
+            continue
+        for j in range(1, len(time_cumsum)):
+            if timei <= time_cumsum[j]:
+                planner_interpolate = planner_array[j - 1].interpolate(timei - time_cumsum[j - 1])
+                if isinstance(planner_interpolate, np.ndarray):
+                    joint = planner_interpolate
+                    robot.move_joint(joint)
+                else:
+                    robot.move_cartesian(planner_interpolate)
+                    joint = robot.get_joint()
+                action[:robot.dof] = joint
+                env.step(action)
+                break
+
+
+def run_gripper(env, action, openness_start, openness_end, steps=1500):
+    for i in range(steps):
+        openness = openness_start + (openness_end - openness_start) * (i + 1) / steps
+        if hasattr(env, "set_gripper_action"):
+            env.set_gripper_action(action, openness)
+        env.step(action)
+    if hasattr(env, "set_gripper_action"):
+        env.set_gripper_action(action, openness_end)
+    for _ in range(300):
+        env.step(action)
+
+
+def hold_pose(env, action, steps=300):
+    for _ in range(steps):
+        env.step(action)
+
+
+def log_gripper_state(env, label):
+    try:
+        joint7 = float(np.asarray(mj.get_joint_q(env.mj_model, env.mj_data, "joint7")).reshape(-1)[0])
+        joint8 = float(np.asarray(mj.get_joint_q(env.mj_model, env.mj_data, "joint8")).reshape(-1)[0])
+        print(f"[{label}] joint7={joint7:.4f}, joint8={joint8:.4f}")
+    except Exception as exc:
+        print(f"[{label}] failed to read gripper joints: {exc}")
+
+
+def get_arm_joint_state(env):
+    joint_values = []
+    for joint_name in env.joint_names[:env.robot.dof]:
+        joint_values.append(float(np.asarray(mj.get_joint_q(env.mj_model, env.mj_data, joint_name)).reshape(-1)[0]))
+    return np.array(joint_values, dtype=float)
+
+
+def wait_until_joint_target(env, action, target_joint, tol=1e-2, max_steps=3000, log_label=None):
+    target_joint = np.asarray(target_joint, dtype=float)
+    for step_idx in range(max_steps):
+        env.step(action)
+        current_joint = get_arm_joint_state(env)
+        if np.max(np.abs(current_joint - target_joint)) <= tol:
+            if log_label is not None:
+                print(f"[{log_label}] reached target in {step_idx + 1} steps")
+            return current_joint
+    current_joint = get_arm_joint_state(env)
+    if log_label is not None:
+        print(f"[{log_label}] timeout, current={np.round(current_joint, 4)}, target={np.round(target_joint, 4)}")
+    return current_joint
+
+
+def viewer_is_running(env):
+    if env.mj_viewer is None:
+        return True
+    is_running = getattr(env.mj_viewer, "is_running", None)
+    if callable(is_running):
+        return bool(is_running())
+    return True
+
+
+def execute_grasp_cycle(env, net, home_joint, motion_time_scale, gripper_steps, settle_steps, visual=True):
+    for _ in range(200):
         env.step()
-    imgs = env.render()
 
-    gg = generate_grasps(net, imgs, True)
+    imgs = env.render()
+    gg = generate_grasps(net, imgs, visual)
+    if len(gg) == 0:
+        print("[grasp_cycle] no valid grasps found, skip this round")
+        return False
 
     robot = env.robot
     T_wb = robot.base
@@ -143,18 +223,28 @@ if __name__ == '__main__':
     T_co = sm.SE3.Trans(gg.translations[0]) * sm.SE3(
         sm.SO3.TwoVectors(x=gg.rotation_matrices[0][:, 0], y=gg.rotation_matrices[0][:, 1]))
 
-    T_wo = T_wc * T_co
+    # Right-multiply an axis-alignment transform so the grasp pose matches
+    # the gripper frame convention expected by the Piper pipeline.
+    T_align = sm.SE3(np.array([
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, -1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]), check=False)
+    T_co = T_co * T_align
 
-    time0 = 2
+    T_wo = T_wc * T_co * sm.SE3(0.02, 0.0, 0.0)
+
+    time0 = 2 * motion_time_scale
     q0 = robot.get_joint()
-    q1 = np.array([0.0, 0.0, np.pi / 2, 0.0, -np.pi / 2, 0.0])
+    q1 = np.array([0.0, 1.2, -1.0, 0.0, 0.8, 0.0])
 
     parameter0 = JointParameter(q0, q1)
     velocity_parameter0 = QuinticVelocityParameter(time0)
     trajectory_parameter0 = TrajectoryParameter(parameter0, velocity_parameter0)
     planner0 = TrajectoryPlanner(trajectory_parameter0)
 
-    time1 = 2
+    time1 = 2 * motion_time_scale
     robot.set_joint(q1)
     T1 = robot.get_cartesian()
     T2 = T_wo * sm.SE3(-0.1, 0.0, 0.0)
@@ -165,7 +255,7 @@ if __name__ == '__main__':
     trajectory_parameter1 = TrajectoryParameter(cartesian_parameter1, velocity_parameter1)
     planner1 = TrajectoryPlanner(trajectory_parameter1)
 
-    time2 = 2
+    time2 = 2 * motion_time_scale
     T3 = T_wo
     position_parameter2 = LinePositionParameter(T2.t, T3.t)
     attitude_parameter2 = OneAttitudeParameter(sm.SO3(T2.R), sm.SO3(T3.R))
@@ -174,36 +264,14 @@ if __name__ == '__main__':
     trajectory_parameter2 = TrajectoryParameter(cartesian_parameter2, velocity_parameter2)
     planner2 = TrajectoryPlanner(trajectory_parameter2)
 
-    time_array = [0, time0, time1, time2]
-    planner_array = [planner0, planner1, planner2]
-    total_time = np.sum(time_array)
+    action = np.zeros(env.action_dim)
+    if hasattr(env, "set_gripper_action"):
+        env.set_gripper_action(action, 1.0)
+    run_planners(env, robot, action, [planner0, planner1, planner2], [0.0, time0, time1, time2])
+    run_gripper(env, action, 1.0, 0.0, steps=gripper_steps)
+    log_gripper_state(env, "after_close")
 
-    time_step_num = round(total_time / 0.002) + 1
-    times = np.linspace(0, total_time, time_step_num)
-
-    time_cumsum = np.cumsum(time_array)
-    action = np.zeros(7)
-    for i, timei in enumerate(times):
-        for j in range(len(time_cumsum)):
-            if timei < time_cumsum[j]:
-                planner_interpolate = planner_array[j - 1].interpolate(timei - time_cumsum[j - 1])
-                if isinstance(planner_interpolate, np.ndarray):
-                    joint = planner_interpolate
-                    robot.move_joint(joint)
-                else:
-                    robot.move_cartesian(planner_interpolate)
-                    joint = robot.get_joint()
-                action[:6] = joint
-                # action[:] = np.hstack((joint, [0.0]))
-                env.step(action)
-                break
-
-    for i in range(1500):
-        action[-1] += 0.2
-        action[-1] = np.min([action[-1], 255])
-        env.step(action)
-
-    time3 = 2
+    time3 = 2 * motion_time_scale
     T4 = sm.SE3.Trans(0.0, 0.0, 0.1) * T3
     position_parameter3 = LinePositionParameter(T3.t, T4.t)
     attitude_parameter3 = OneAttitudeParameter(sm.SO3(T3.R), sm.SO3(T4.R))
@@ -212,8 +280,10 @@ if __name__ == '__main__':
     trajectory_parameter3 = TrajectoryParameter(cartesian_parameter3, velocity_parameter3)
     planner3 = TrajectoryPlanner(trajectory_parameter3)
 
-    time4 = 2
-    T5 = sm.SE3.Trans(1.4, 0.2, T4.t[2]) * sm.SE3(sm.SO3(T4.R))
+    drop_target = np.array([0.4, 0.2, 0.73])
+
+    time4 = 2 * motion_time_scale
+    T5 = sm.SE3.Trans(drop_target[0], drop_target[1], T4.t[2]) * sm.SE3(sm.SO3(T4.R))
     position_parameter4 = LinePositionParameter(T4.t, T5.t)
     attitude_parameter4 = OneAttitudeParameter(sm.SO3(T4.R), sm.SO3(T5.R))
     cartesian_parameter4 = CartesianParameter(position_parameter4, attitude_parameter4)
@@ -221,120 +291,69 @@ if __name__ == '__main__':
     trajectory_parameter4 = TrajectoryParameter(cartesian_parameter4, velocity_parameter4)
     planner4 = TrajectoryPlanner(trajectory_parameter4)
 
-    time5 = 2
-    T6 = sm.SE3.Trans(0.2, 0.2, T5.t[2]) * sm.SE3(sm.SO3.Rz(-np.pi / 2) * sm.SO3(T5.R))
-    position_parameter5 = LinePositionParameter(T5.t, T6.t)
-    attitude_parameter5 = OneAttitudeParameter(sm.SO3(T5.R), sm.SO3(T6.R))
-    cartesian_parameter5 = CartesianParameter(position_parameter5, attitude_parameter5)
-    velocity_parameter5 = QuinticVelocityParameter(time5)
-    trajectory_parameter5 = TrajectoryParameter(cartesian_parameter5, velocity_parameter5)
-    planner5 = TrajectoryPlanner(trajectory_parameter5)
+    run_planners(env, robot, action, [planner3, planner4], [0.0, time3, time4])
+    hold_pose(env, action, steps=settle_steps)
+    run_gripper(env, action, 0.0, 1.0, steps=gripper_steps)
+    log_gripper_state(env, "after_open")
 
-    time6 = 2
-    T7 = sm.SE3.Trans(0.0, 0.0, -0.1) * T6
-    position_parameter6 = LinePositionParameter(T6.t, T7.t)
-    attitude_parameter6 = OneAttitudeParameter(sm.SO3(T6.R), sm.SO3(T7.R))
-    cartesian_parameter6 = CartesianParameter(position_parameter6, attitude_parameter6)
-    velocity_parameter6 = QuinticVelocityParameter(time6)
-    trajectory_parameter6 = TrajectoryParameter(cartesian_parameter6, velocity_parameter6)
-    planner6 = TrajectoryPlanner(trajectory_parameter6)
-
-    time_array = [0.0, time3, time4, time5, time6]
-    planner_array = [planner3, planner4, planner5, planner6]
-    total_time = np.sum(time_array)
-
-    time_step_num = round(total_time / 0.002) + 1
-    times = np.linspace(0.0, total_time, time_step_num)
-
-    time_cumsum = np.cumsum(time_array)
-    for timei in times:
-        for j in range(len(time_cumsum)):
-            if timei == 0.0:
-                break
-            if timei <= time_cumsum[j]:
-                planner_interpolate = planner_array[j - 1].interpolate(timei - time_cumsum[j - 1])
-                if isinstance(planner_interpolate, np.ndarray):
-                    joint = planner_interpolate
-                    robot.move_joint(joint)
-                else:
-                    robot.move_cartesian(planner_interpolate)
-                    joint = robot.get_joint()
-                action[:6] = joint
-                env.step(action)
-                break
-
-    for i in range(1500):
-        action[-1] -= 0.2
-        action[-1] = np.max([action[-1], 0])
-        env.step(action)
-
-    time7 = 2
-    T8 = sm.SE3.Trans(0.0, 0.0, 0.2) * T7
-    position_parameter7 = LinePositionParameter(T7.t, T8.t)
-    attitude_parameter7 = OneAttitudeParameter(sm.SO3(T7.R), sm.SO3(T8.R))
-    cartesian_parameter7 = CartesianParameter(position_parameter7, attitude_parameter7)
+    time7 = 2 * motion_time_scale
+    q_release = robot.get_joint()
+    q_safe = q1
+    parameter7 = JointParameter(q_release, q_safe)
     velocity_parameter7 = QuinticVelocityParameter(time7)
-    trajectory_parameter7 = TrajectoryParameter(cartesian_parameter7, velocity_parameter7)
+    trajectory_parameter7 = TrajectoryParameter(parameter7, velocity_parameter7)
     planner7 = TrajectoryPlanner(trajectory_parameter7)
 
-    time_array = [0.0, time7]
-    planner_array = [planner7]
-    total_time = np.sum(time_array)
+    run_planners(env, robot, action, [planner7], [0.0, time7])
 
-    time_step_num = round(total_time / 0.002) + 1
-    times = np.linspace(0.0, total_time, time_step_num)
-
-    time_cumsum = np.cumsum(time_array)
-    for timei in times:
-        for j in range(len(time_cumsum)):
-            if timei == 0.0:
-                break
-            if timei <= time_cumsum[j]:
-                planner_interpolate = planner_array[j - 1].interpolate(timei - time_cumsum[j - 1])
-                if isinstance(planner_interpolate, np.ndarray):
-                    joint = planner_interpolate
-                    robot.move_joint(joint)
-                else:
-                    robot.move_cartesian(planner_interpolate)
-                    joint = robot.get_joint()
-                action[:6] = joint
-                env.step(action)
-                break
-
-    time8 = 2.0
+    time8 = 2.0 * motion_time_scale
     q8 = robot.get_joint()
-    q9 = q0
+    q9 = home_joint
 
     parameter8 = JointParameter(q8, q9)
     velocity_parameter8 = QuinticVelocityParameter(time8)
     trajectory_parameter8 = TrajectoryParameter(parameter8, velocity_parameter8)
     planner8 = TrajectoryPlanner(trajectory_parameter8)
 
-    time_array = [0.0, time8]
-    planner_array = [planner8]
-    total_time = np.sum(time_array)
+    run_planners(env, robot, action, [planner8], [0.0, time8])
+    env.set_arm_action(action, home_joint)
+    if hasattr(env, "set_gripper_action"):
+        env.set_gripper_action(action, 1.0)
+    reached_joint = wait_until_joint_target(env, action, home_joint, tol=1e-2, max_steps=2500, log_label="return_home")
+    robot.set_joint(reached_joint)
+    return True
 
-    time_step_num = round(total_time / 0.002) + 1
-    times = np.linspace(0.0, total_time, time_step_num)
 
-    time_cumsum = np.cumsum(time_array)
-    for timei in times:
-        for j in range(len(time_cumsum)):
-            if timei == 0.0:
-                break
-            if timei <= time_cumsum[j]:
-                planner_interpolate = planner_array[j - 1].interpolate(timei - time_cumsum[j - 1])
-                if isinstance(planner_interpolate, np.ndarray):
-                    joint = planner_interpolate
-                    robot.move_joint(joint)
-                else:
-                    robot.move_cartesian(planner_interpolate)
-                    joint = robot.get_joint()
-                action[:6] = joint
-                env.step(action)
-                break
+if __name__ == '__main__':
+    motion_time_scale = 0.6
+    gripper_steps = 800
+    settle_steps = 200
 
-    for i in range(2000):
-        env.step()
+    net = get_net()
 
-    env.close()
+    env = PiperGraspEnv()
+    env.reset()
+    home_joint = get_arm_joint_state(env)
+    cycle_idx = 0
+
+    try:
+        while viewer_is_running(env):
+            cycle_idx += 1
+            print(f"[grasp_cycle] start round {cycle_idx}")
+            finished = execute_grasp_cycle(
+                env,
+                net,
+                home_joint=home_joint,
+                motion_time_scale=motion_time_scale,
+                gripper_steps=gripper_steps,
+                settle_steps=settle_steps,
+                visual=(cycle_idx == 1),
+            )
+            if finished:
+                print(f"[grasp_cycle] round {cycle_idx} finished, robot returned home and will capture next frame")
+            else:
+                print(f"[grasp_cycle] round {cycle_idx} skipped, retry capture")
+    except KeyboardInterrupt:
+        print("[main] interrupted by user")
+    finally:
+        env.close()
