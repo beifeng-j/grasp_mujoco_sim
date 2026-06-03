@@ -1,2 +1,0 @@
-class MotionParameter:
-    pass

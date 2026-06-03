@@ -147,7 +147,7 @@ def run_planners(env, robot, action, planner_array, time_array):
                 break
 
 
-def run_gripper(env, action, openness_start, openness_end, steps=1500):
+def run_gripper(env, action, openness_start, openness_end, steps=400):
     for i in range(steps):
         openness = openness_start + (openness_end - openness_start) * (i + 1) / steps
         if hasattr(env, "set_gripper_action"):
@@ -155,7 +155,7 @@ def run_gripper(env, action, openness_start, openness_end, steps=1500):
         env.step(action)
     if hasattr(env, "set_gripper_action"):
         env.set_gripper_action(action, openness_end)
-    for _ in range(300):
+    for _ in range(20):
         env.step(action)
 
 
@@ -204,20 +204,22 @@ def viewer_is_running(env):
     return True
 
 
-def execute_grasp_cycle(env, net, home_joint, motion_time_scale, gripper_steps, settle_steps, visual=True):
+def execute_grasp_cycle(env, net, home_joint, q1, motion_time_scale, gripper_steps, settle_steps, drop_target):
     for _ in range(200):
         env.step()
 
     imgs = env.render()
-    gg = generate_grasps(net, imgs, visual)
+    gg = generate_grasps(net, imgs, visual=True)
     if len(gg) == 0:
         print("[grasp_cycle] no valid grasps found, skip this round")
         return False
 
     robot = env.robot
     T_wb = robot.base
-    n_wc = np.array([0.0, -1.0, 0.0])
-    o_wc = np.array([-1.0, 0.0, -0.5])
+    # Keep the camera position fixed and rotate its optical frame 180 degrees
+    # around the current camera z-axis so this stays consistent with scene.xml.
+    n_wc = np.array([0.0, 1.0, 0.0])
+    o_wc = np.array([1.0, 0.0, 0.5])
     t_wc = np.array([1.0, 0.6, 2.0])
     T_wc = sm.SE3.Trans(t_wc) * sm.SE3(sm.SO3.TwoVectors(x=n_wc, y=o_wc))
     T_co = sm.SE3.Trans(gg.translations[0]) * sm.SE3(
@@ -233,21 +235,38 @@ def execute_grasp_cycle(env, net, home_joint, motion_time_scale, gripper_steps, 
     ]), check=False)
     T_co = T_co * T_align
 
-    T_wo = T_wc * T_co * sm.SE3(0.02, 0.0, 0.0)
+    # Move the gripper centre deeper along the approach direction (z-axis)
+    # so the fingers wrap around the object instead of just touching its surface.
+    T_wo = T_wc * T_co * sm.SE3(0.0, 0.0, 0.0)
 
+    # Read the actual physical joint state before we overwrite the kinematic
+    # model for the z-flip check, so planner0 correctly plans from where the
+    # arm really is (home_joint) to the photo pose q1.
+    q0 = get_arm_joint_state(env)
+
+    # If the grasp z-axis is nearly opposite to q1's z-axis (within ~90 deg),
+    # the two-finger symmetry lets us flip 180 around z — this avoids the
+    # planner taking a 180 rotation when it could just stay on the nearer side.
+    robot.set_joint(q1)
+    T1 = robot.get_cartesian()
+    # Compare y-axis (finger direction): if opposite, flip 180 around z
+    y_grasp = np.array(T_wo.R[:, 1]).flatten()
+    y_t1 = np.array(T1.R[:, 1]).flatten()
+    if np.dot(y_grasp, y_t1) < 0:
+        T_wo = T_wo * sm.SE3(sm.SO3.Rz(np.pi))
+
+    # planner0: home_joint -> q1
     time0 = 2 * motion_time_scale
-    q0 = robot.get_joint()
-    q1 = np.array([0.0, 1.2, -1.0, 0.0, 0.8, 0.0])
-
     parameter0 = JointParameter(q0, q1)
     velocity_parameter0 = QuinticVelocityParameter(time0)
     trajectory_parameter0 = TrajectoryParameter(parameter0, velocity_parameter0)
     planner0 = TrajectoryPlanner(trajectory_parameter0)
 
+    # Robot is already at q1 — jump straight to cartesian approach
     time1 = 2 * motion_time_scale
     robot.set_joint(q1)
     T1 = robot.get_cartesian()
-    T2 = T_wo * sm.SE3(-0.1, 0.0, 0.0)
+    T2 = T_wo * sm.SE3(0.0, 0.0, -0.1)
     position_parameter1 = LinePositionParameter(T1.t, T2.t)
     attitude_parameter1 = OneAttitudeParameter(sm.SO3(T1.R), sm.SO3(T2.R))
     cartesian_parameter1 = CartesianParameter(position_parameter1, attitude_parameter1)
@@ -280,8 +299,6 @@ def execute_grasp_cycle(env, net, home_joint, motion_time_scale, gripper_steps, 
     trajectory_parameter3 = TrajectoryParameter(cartesian_parameter3, velocity_parameter3)
     planner3 = TrajectoryPlanner(trajectory_parameter3)
 
-    drop_target = np.array([0.4, 0.2, 0.73])
-
     time4 = 2 * motion_time_scale
     T5 = sm.SE3.Trans(drop_target[0], drop_target[1], T4.t[2]) * sm.SE3(sm.SO3(T4.R))
     position_parameter4 = LinePositionParameter(T4.t, T5.t)
@@ -292,30 +309,19 @@ def execute_grasp_cycle(env, net, home_joint, motion_time_scale, gripper_steps, 
     planner4 = TrajectoryPlanner(trajectory_parameter4)
 
     run_planners(env, robot, action, [planner3, planner4], [0.0, time3, time4])
-    hold_pose(env, action, steps=settle_steps)
     run_gripper(env, action, 0.0, 1.0, steps=gripper_steps)
     log_gripper_state(env, "after_open")
 
     time7 = 2 * motion_time_scale
     q_release = robot.get_joint()
-    q_safe = q1
-    parameter7 = JointParameter(q_release, q_safe)
+
+    # Go straight back to home
+    parameter7 = JointParameter(q_release, home_joint)
     velocity_parameter7 = QuinticVelocityParameter(time7)
     trajectory_parameter7 = TrajectoryParameter(parameter7, velocity_parameter7)
     planner7 = TrajectoryPlanner(trajectory_parameter7)
 
     run_planners(env, robot, action, [planner7], [0.0, time7])
-
-    time8 = 2.0 * motion_time_scale
-    q8 = robot.get_joint()
-    q9 = home_joint
-
-    parameter8 = JointParameter(q8, q9)
-    velocity_parameter8 = QuinticVelocityParameter(time8)
-    trajectory_parameter8 = TrajectoryParameter(parameter8, velocity_parameter8)
-    planner8 = TrajectoryPlanner(trajectory_parameter8)
-
-    run_planners(env, robot, action, [planner8], [0.0, time8])
     env.set_arm_action(action, home_joint)
     if hasattr(env, "set_gripper_action"):
         env.set_gripper_action(action, 1.0)
@@ -326,33 +332,52 @@ def execute_grasp_cycle(env, net, home_joint, motion_time_scale, gripper_steps, 
 
 if __name__ == '__main__':
     motion_time_scale = 0.6
-    gripper_steps = 800
-    settle_steps = 200
+    gripper_steps = 150
+    settle_steps = 80
 
     net = get_net()
+
+    drop_targets = [
+        np.array([0.4, 0.2, 0.9]),
+        np.array([0.4, 0.3, 0.9]),
+        np.array([0.3, 0.2, 0.9]),
+    ]
 
     env = PiperGraspEnv()
     env.reset()
     home_joint = get_arm_joint_state(env)
+    q1 = np.array([0.0, 1.2, -1.0, 0.0, 0.8, 0.0])
+    env.step()  # prime
+    robot = env.robot
+    action = np.zeros(env.action_dim)
+    if hasattr(env, "set_gripper_action"):
+        env.set_gripper_action(action, 1.0)
+    robot.set_joint(home_joint)
     cycle_idx = 0
 
     try:
         while viewer_is_running(env):
             cycle_idx += 1
-            print(f"[grasp_cycle] start round {cycle_idx}")
+            drop_target = drop_targets[(cycle_idx - 1) % len(drop_targets)]
+            print(f"[grasp_cycle] start round {cycle_idx}, drop_target=({drop_target[0]:.1f}, {drop_target[1]:.1f})")
             finished = execute_grasp_cycle(
                 env,
                 net,
                 home_joint=home_joint,
+                q1=q1,
                 motion_time_scale=motion_time_scale,
                 gripper_steps=gripper_steps,
                 settle_steps=settle_steps,
-                visual=(cycle_idx == 1),
+                drop_target=drop_target,
             )
             if finished:
                 print(f"[grasp_cycle] round {cycle_idx} finished, robot returned home and will capture next frame")
             else:
                 print(f"[grasp_cycle] round {cycle_idx} skipped, retry capture")
+
+        # Keep rendering after all cycles
+        while viewer_is_running(env):
+            env.step()
     except KeyboardInterrupt:
         print("[main] interrupted by user")
     finally:
